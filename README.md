@@ -8,6 +8,7 @@ If you just want to recover files, enter the drive letter then hit enter a coupl
 It will pick up where you left off if you close the window partway through.
 
 If you prefer to skip the prompts (Where X is the drive letter): python data_pycovery.py "\\.\X:" --types png,jpg,7z,zip,exe,pdf,mp3
+
 If you are not trying to recover files, but instead trying to prevent data recovery by formatting allocated clusters, run as admin and use --wipe.
 
 Formats currently recovered during scan:
