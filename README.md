@@ -3,7 +3,7 @@ A crappy but opensource data recovery option, just bulk dumps every recognized f
 
 Also able to format unallocated clusters, while leaving existing files alone.
 
-Currently only supports NTFS, on Windows.
+Currently only supports NTFS, on Windows. FAT support is incomplete, use with caution.
 
 This script will stress your drive a fair bit, and is not recommended for most use cases.
 
