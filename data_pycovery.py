@@ -1,7 +1,9 @@
+#todo: esp, nsp, knp, safetensors, dir
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse, os, struct, sys, time, zlib, re
+import argparse, os, struct, sys, time, zlib, re, atexit
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Iterator
@@ -17,6 +19,11 @@ EXE_MZ = b"MZ"
 PDF_SIG, PDF_EOF, PDF_STARTXREF = b"%PDF-", b"%%EOF", b"startxref"
 MP3_ID3, MP3_TAG = b"ID3", b"TAG"
 NES_SIG = b"NES\x1A"
+PFS0_SIG = b"PFS0"
+MP4_FTYP = b"ftyp"
+GIF_SIG = b"GIF"
+GIF87A, GIF89A = b"GIF87a", b"GIF89a"
+WEBP_RIFF, WEBP_WEBP = b"RIFF", b"WEBP"
 
 TXT_MIN_BYTES = 0x1000
 
@@ -33,13 +40,17 @@ LIMITS = {
     "pdf": dict(sig=PDF_SIG,    maxb=256 * 1024**2,   maxn=200,  minb=512),
     "mp3": dict(sig=MP3_ID3,    maxb=256 * 1024**2,   maxn=200,  minb=2048),
     "txt": dict(sig=b"",        maxb=64 * 1024**2,    maxn=2000, minb=TXT_MIN_BYTES),
-    "nes": dict(sig=NES_SIG,  maxb=8 * 1024**2,    maxn=500,  minb=16 + 16 * 1024),
+    "nes": dict(sig=NES_SIG,    maxb=8 * 1024**2,     maxn=500,  minb=16 + 16 * 1024),
+    "nsp": dict(sig=PFS0_SIG,  maxb=4 * 1024**3,     maxn=50,   minb=0x4000),
+    "mp4": dict(sig=MP4_FTYP,  maxb=32 * 1024**3,    maxn=50,   minb=4096),
+    "gif": dict(sig=GIF_SIG,    maxb=256 * 1024**2,   maxn=200,  minb=32),
+    "webp": dict(sig=WEBP_RIFF, maxb=256 * 1024**2,   maxn=200,  minb=32),
 }
 
 # ---- Raw device I/O ----
 
 if os.name != "nt":
-    raise SystemExit("This script is Windows/NTFS-only.")
+    raise SystemExit("This script is Windows-only (raw volume access).")
 
 import ctypes
 from ctypes import wintypes
@@ -92,6 +103,11 @@ GetVolumeInformationW = _sig("GetVolumeInformationW", wintypes.BOOL,
     ctypes.POINTER(wintypes.DWORD),
     ctypes.POINTER(wintypes.DWORD),
     wintypes.LPWSTR, wintypes.DWORD
+)
+GetDiskFreeSpaceW = _sig("GetDiskFreeSpaceW", wintypes.BOOL,
+    wintypes.LPCWSTR,
+    ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)
 )
 
 def _raise_last(msg: str) -> None:
@@ -189,6 +205,8 @@ def open_device(path: str, write: bool = False) -> WinRawDevice:
 U16 = struct.Struct("<H").unpack_from
 U32 = struct.Struct("<I").unpack_from
 U64 = struct.Struct("<Q").unpack_from
+BE32 = struct.Struct(">I").unpack_from
+BE64 = struct.Struct(">Q").unpack_from
 
 def fmt_bytes(n: int) -> str:
     x = float(n)
@@ -198,7 +216,7 @@ def fmt_bytes(n: int) -> str:
         x /= 1024.0
     return f"{x:.2f} PiB"
 
-def ntfs_serial(volume_device: str) -> str:
+def volume_serial(volume_device: str) -> str:
     s = (volume_device or "").strip()
     if not (s.startswith("\\\\.\\") and len(s) >= 6 and s[4].isalpha() and s[5] == ":"):
         return "UNKNOWN"
@@ -211,6 +229,22 @@ def ntfs_serial(volume_device: str) -> str:
     flags = wintypes.DWORD(0)
     ok = GetVolumeInformationW(root, vol, len(vol), ctypes.byref(serial), ctypes.byref(maxc), ctypes.byref(flags), fs, len(fs))
     return f"{serial.value:08X}" if ok else "UNKNOWN"
+
+def win_bps_bpc(volume_device: str):
+    s = (volume_device or "").strip()
+    if not (s.startswith("\\\\.\\") and len(s) >= 6 and s[4].isalpha() and s[5] == ":"):
+        return None
+    drive = s[4].upper()
+    root = f"{drive}:\\"
+
+    spc = wintypes.DWORD(0)
+    bps = wintypes.DWORD(0)
+    nfc = wintypes.DWORD(0)
+    tnc = wintypes.DWORD(0)
+    ok = GetDiskFreeSpaceW(root, ctypes.byref(spc), ctypes.byref(bps), ctypes.byref(nfc), ctypes.byref(tnc))
+    if not ok or spc.value == 0 or bps.value == 0:
+        return None
+    return int(bps.value), int(spc.value) * int(bps.value)
 
 INDEX_LINE_RE = re.compile(r"^([0-9A-Fa-f]{16}) ([0-9A-Fa-f]{8}) ([A-Za-z0-9]+)$")
 
@@ -246,6 +280,25 @@ def emit_found(out_dir: Path, index_entries: list[tuple[int, str, int]], ext: st
     (out_dir / name).write_bytes(data)
     index_entries.append((off, ext, h))
 
+def emit_found_file(out_dir: Path, index_entries: list[tuple[int, str, int]], ext: str, off: int, tmp_path: Path, final_len: int) -> None:
+    with tmp_path.open("r+b") as f:
+        f.truncate(final_len)
+
+    h = 0
+    with tmp_path.open("rb") as f:
+        while True:
+            b = f.read(8 * 1024**2)
+            if not b:
+                break
+            h = zlib.crc32(b, h)
+    h &= 0xFFFFFFFF
+
+    final_name = f"{off:016X}_{h:08X}.{ext}"
+    final_path = out_dir / final_name
+    tmp_path.replace(final_path)
+
+    index_entries.append((off, ext, h))
+
 POPCNT = [bin(i).count("1") for i in range(256)]
 WS = b" \t\r\n\f\0"
 
@@ -258,6 +311,9 @@ class NTFSInfo:
     total_sectors: int
     mft_lcn: int
     frs: int
+
+    def cl_to_off(self, cl: int) -> int:
+        return cl * self.bpc
 
 def s8(x: int) -> int:
     return struct.unpack("b", bytes([x & 0xFF]))[0]
@@ -391,7 +447,7 @@ def load_bitmap(dev: WinRawDevice, nt: NTFSInfo) -> bytes:
             return bytes(read_runs(dev, nt, runs, byte_len=real_size))
     raise ValueError("No nonresident $DATA in $Bitmap record 6.")
 
-def iter_free_cluster_runs(bitmap: bytes):
+def iter_free_cluster_runs_ntfs(bitmap: bytes):
     in_run = False
     run_start = run_len = 0
     cl = 0
@@ -424,7 +480,7 @@ def iter_free_cluster_runs(bitmap: bytes):
     if in_run:
         yield run_start, run_len
 
-def unalloc_bytes(nt: NTFSInfo, bitmap: bytes, volume_bytes: int) -> int:
+def unalloc_bytes_ntfs(nt: NTFSInfo, bitmap: bytes, volume_bytes: int) -> int:
     total_clusters = volume_bytes // nt.bpc
     if total_clusters <= 0:
         return 0
@@ -441,6 +497,142 @@ def unalloc_bytes(nt: NTFSInfo, bitmap: bytes, volume_bytes: int) -> int:
         last = bitmap[full_bytes] & mask
         free += rem_bits - POPCNT[last]
     return free * nt.bpc
+
+# ---- FAT32 ----
+
+@dataclass
+class FAT32Info:
+    bps: int
+    spc: int
+    bpc: int
+    total_sectors: int
+    reserved: int
+    nfats: int
+    fatsz: int
+    root_cluster: int
+    first_data_sector: int
+    total_clusters: int
+    fat0_off: int
+
+    def cl_to_off(self, cl: int) -> int:
+        return (self.first_data_sector * self.bps) + (cl - 2) * self.bpc
+
+def parse_fat32_boot(bs: bytes) -> FAT32Info:
+    bps = U16(bs, 11)[0]
+    spc = bs[13]
+    reserved = U16(bs, 14)[0]
+    nfats = bs[16]
+    root_ent_cnt = U16(bs, 17)[0]
+    tot16 = U16(bs, 19)[0]
+    fatsz16 = U16(bs, 22)[0]
+    tot32 = U32(bs, 32)[0]
+    fatsz32 = U32(bs, 36)[0]
+    root_cluster = U32(bs, 44)[0]
+
+    total_sectors = tot16 if tot16 else tot32
+    fatsz = fatsz32 if fatsz32 else fatsz16
+
+    if bps == 0 or spc == 0 or reserved == 0 or nfats == 0 or fatsz == 0 or total_sectors == 0:
+        raise ValueError("Bad FAT BPB.")
+    if root_ent_cnt != 0:
+        raise ValueError("Not FAT32 (looks like FAT12/16).")
+    if bs[0x52:0x5A].rstrip(b"\x00 ").startswith(b"FAT32") is False:
+        raise ValueError("Not FAT32.")
+
+    bpc = bps * spc
+    first_data_sector = reserved + nfats * fatsz
+    data_sectors = total_sectors - first_data_sector
+    total_clusters = data_sectors // spc
+
+    fat0_off = reserved * bps
+    return FAT32Info(
+        bps=bps, spc=spc, bpc=bpc, total_sectors=total_sectors,
+        reserved=reserved, nfats=nfats, fatsz=fatsz, root_cluster=root_cluster,
+        first_data_sector=first_data_sector, total_clusters=total_clusters,
+        fat0_off=fat0_off,
+    )
+
+def fat32_count_free_clusters(dev: WinRawDevice, fat: FAT32Info) -> int:
+    fat_bytes = fat.fatsz * fat.bps
+    max_cluster = fat.total_clusters + 1
+    want_entries = max_cluster + 1
+    want_bytes = want_entries * 4
+    if want_bytes > fat_bytes:
+        want_bytes = fat_bytes
+
+    block = 8 * 1024**2
+    block -= (block % SECTOR_ALIGN)
+    block = max(block, SECTOR_ALIGN)
+    buf = bytearray(block)
+
+    free = 0
+    pos = 0
+    while pos < want_bytes:
+        take = min(block, want_bytes - pos)
+        take -= (take % SECTOR_ALIGN)
+        if take <= 0:
+            break
+        dev.read_into(fat.fat0_off + pos, buf, take)
+        base_entry = pos // 4
+        n_entries = take // 4
+        for i in range(n_entries):
+            cl = base_entry + i
+            if cl < 2:
+                continue
+            v = U32(buf, i * 4)[0] & 0x0FFFFFFF
+            if v == 0:
+                free += 1
+        pos += take
+    return free
+
+def iter_free_cluster_runs_fat32(dev: WinRawDevice, fat: FAT32Info):
+    fat_bytes = fat.fatsz * fat.bps
+    max_cluster = fat.total_clusters + 1
+    want_entries = max_cluster + 1
+    want_bytes = want_entries * 4
+    if want_bytes > fat_bytes:
+        want_bytes = fat_bytes
+
+    block = 8 * 1024**2
+    block -= (block % SECTOR_ALIGN)
+    block = max(block, SECTOR_ALIGN)
+    buf = bytearray(block)
+
+    in_run = False
+    run_start = 0
+    run_len = 0
+
+    pos = 0
+    while pos < want_bytes:
+        take = min(block, want_bytes - pos)
+        take -= (take % SECTOR_ALIGN)
+        if take <= 0:
+            break
+        dev.read_into(fat.fat0_off + pos, buf, take)
+        base_entry = pos // 4
+        n_entries = take // 4
+        for i in range(n_entries):
+            cl = base_entry + i
+            if cl < 2:
+                continue
+            v = U32(buf, i * 4)[0] & 0x0FFFFFFF
+            is_free = (v == 0)
+            if is_free:
+                if not in_run:
+                    in_run = True
+                    run_start = cl
+                    run_len = 1
+                else:
+                    run_len += 1
+            else:
+                if in_run:
+                    yield run_start, run_len
+                    in_run = False
+                    run_len = 0
+        pos += take
+
+    if in_run:
+        yield run_start, run_len
 
 # ---- sliding buffer ----
 
@@ -730,6 +922,41 @@ def pdf_end(slb: SLB, maxb: int):
             return -1 if not (0 < end <= maxb) else end
         p = b.rfind(PDF_EOF, base, p)
     return None
+
+def gif_end(slb: SLB, maxb: int):
+    b, base, n = slb.buf, slb.start, slb.n()
+    if n < 13: return None
+    if n > maxb: return -1
+    if b[base:base+6] not in (GIF87A, GIF89A): return -1
+    packed = b[base+10]
+    p = base + 13
+    if packed & 0x80:
+        p += 3 * (1 << ((packed & 7) + 1))
+        if p > base + n: return None
+    end = base + n
+    while True:
+        if p >= end: return None
+        t = b[p]; p += 1
+        if t == 0x3B: return p - base
+        if t == 0x21:
+            if p >= end: return None
+            p += 1
+        elif t == 0x2C:
+            if p + 9 > end: return None
+            ip = b[p+8]; p += 9
+            if ip & 0x80:
+                p += 3 * (1 << ((ip & 7) + 1))
+                if p > end: return None
+            if p >= end: return None
+            p += 1
+        else:
+            return -1
+        while True:
+            if p >= end: return None
+            sz = b[p]; p += 1
+            if sz == 0: break
+            p += sz
+            if p > end: return None
 
 # ---- MP3 ----
 
@@ -1049,7 +1276,6 @@ class Mp3Carver(BaseCarver):
 
     def process(self, chunk: bytearray, got: int, abs_off: int):
         if self.slb.n() == 0:
-            # If there's no ID3 and no 0xFF at all, there's no frame header either.
             if chunk.find(MP3_ID3, 0, got) < 0 and chunk.find(0xFF, 0, got) < 0:
                 self._update_tail(chunk, got)
                 return
@@ -1091,6 +1317,248 @@ class Mp3Carver(BaseCarver):
         if self.slb.n() > self.maxb: return -1
         r = mp3_end(self.slb, self.maxb)
         return 0 if r is None else r
+
+class Mp4Carver:
+    __slots__ = (
+        "tail_max", "tail",
+        "out_dir", "index_entries",
+        "maxb", "maxn", "minb",
+        "count",
+        "active", "tmp_path", "start_off", "written",
+        "pos_valid", "hdr",
+        "box_rem",
+        "saw_ftyp", "saw_moov", "saw_mdat", "boxes",
+        "MP4_TOPLEVEL",
+    )
+
+    def __init__(self, out_dir: Path, index_entries: list):
+        L = LIMITS["mp4"]
+        self.tail_max = 7
+        self.tail = b""
+
+        self.out_dir = out_dir
+        self.index_entries = index_entries
+        self.maxb, self.maxn, self.minb = L["maxb"], L["maxn"], L["minb"]
+        self.count = 0
+
+        self.active = False
+        self.tmp_path = None
+        self.start_off = 0
+        self.written = 0
+
+        self.pos_valid = 0
+        self.hdr = bytearray()
+        self.box_rem = 0
+        self.saw_ftyp = self.saw_moov = self.saw_mdat = False
+        self.boxes = 0
+
+        self.MP4_TOPLEVEL = {
+            b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"uuid",
+            b"mfra", b"moof", b"styp", b"sidx", b"emsg", b"pdin",
+        }
+
+    def reset_stream(self):
+        self.tail = b""
+        if self.active:
+            try:
+                if self.tmp_path and self.tmp_path.exists():
+                    self.tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        self.active = False
+        self.tmp_path = None
+        self.start_off = 0
+        self.written = 0
+
+        self.pos_valid = 0
+        self.hdr.clear()
+        self.box_rem = 0
+        self.saw_ftyp = self.saw_moov = self.saw_mdat = False
+        self.boxes = 0
+        
+    def _mp4_type_ok(self, t: bytes) -> bool:
+        return len(t) == 4 and all(0x20 <= c <= 0x7E for c in t)
+
+    def _update_tail(self, chunk: bytearray, got: int):
+        take = min(self.tail_max, got)
+        self.tail = bytes(chunk[got - take:got]) if take > 0 else b""
+
+    def _try_start(self, chunk: bytearray, got: int, abs_off: int):
+        head_take = min(got, 256)
+        cand = self.tail + bytes(chunk[:head_take])
+        p = cand.find(MP4_FTYP)
+        if p < 0:
+            return None
+
+        start = p - 4
+        if start < 0:
+            return None
+
+        sz = BE32(cand, start)[0]
+        if sz < 8 or sz > 256 * 1024:
+            return None
+
+        if p + 8 <= len(cand):
+            brand = cand[p + 4:p + 8]
+            if not all(0x20 <= c <= 0x7E for c in brand):
+                return None
+
+        abs_start = abs_off - len(self.tail) + start
+
+        if start < len(self.tail):
+            init = self.tail[start:] + bytes(chunk[:got])
+        else:
+            k = start - len(self.tail)
+            if k >= got:
+                return None
+            init = bytes(chunk[k:got])
+
+        return abs_start, init
+
+    def _feed_parser(self, data: bytes):
+        i = 0
+        n = len(data)
+
+        while i < n:
+            if self.pos_valid > self.maxb:
+                return -1
+
+            if self.box_rem:
+                take = min(self.box_rem, n - i)
+                self.box_rem -= take
+                self.pos_valid += take
+                i += take
+                continue
+
+            need8 = 8 - len(self.hdr)
+            if need8 > 0:
+                take = min(need8, n - i)
+                self.hdr.extend(data[i:i + take])
+                i += take
+                if len(self.hdr) < 8:
+                    return None
+
+            sz32 = BE32(self.hdr, 0)[0]
+            typ = bytes(self.hdr[4:8])
+
+            def finish_or_fail():
+                if self.saw_ftyp and (self.saw_moov or self.saw_mdat) and self.boxes >= 2 and self.pos_valid >= self.minb:
+                    return int(self.pos_valid)
+                return -1
+
+            if not self._mp4_type_ok(typ):
+                return finish_or_fail()
+
+            if self.boxes == 0:
+                if typ != b"ftyp":
+                    return -1
+            else:
+                if typ not in self.MP4_TOPLEVEL:
+                    return finish_or_fail()
+
+            if sz32 == 0:
+                return finish_or_fail()
+
+            header_len = 8
+            size = sz32
+
+            if sz32 == 1:
+                if len(self.hdr) < 16:
+                    take = min(16 - len(self.hdr), n - i)
+                    self.hdr.extend(data[i:i + take])
+                    i += take
+                    if len(self.hdr) < 16:
+                        return None
+                size = BE64(self.hdr, 8)[0]
+                header_len = 16
+
+            if size < header_len:
+                return -1
+            if self.pos_valid + size > self.maxb:
+                return -1
+
+            self.pos_valid += header_len
+            self.boxes += 1
+            if typ == b"ftyp": self.saw_ftyp = True
+            elif typ == b"moov": self.saw_moov = True
+            elif typ == b"mdat": self.saw_mdat = True
+
+            self.box_rem = int(size - header_len)
+            self.hdr.clear()
+
+        return None
+
+    def process(self, chunk: bytearray, got: int, abs_off: int):
+        if self.count >= self.maxn:
+            self._update_tail(chunk, got)
+            return
+
+        if not self.active:
+            st = self._try_start(chunk, got, abs_off)
+            if st is None:
+                self._update_tail(chunk, got)
+                return
+
+            off, init = st
+            self.start_off = off
+            self.tmp_path = self.out_dir / f"{off:016X}.mp4.part"
+            try:
+                with self.tmp_path.open("wb") as f:
+                    f.write(init)
+            except Exception:
+                self.reset_stream()
+                self._update_tail(chunk, got)
+                return
+
+            self.active = True
+            self.written = len(init)
+
+            self.pos_valid = 0
+            self.hdr.clear()
+            self.box_rem = 0
+            self.saw_ftyp = self.saw_moov = self.saw_mdat = False
+            self.boxes = 0
+
+            r = self._feed_parser(init)
+            if r == -1:
+                self.reset_stream()
+                self._update_tail(chunk, got)
+                return
+            if isinstance(r, int):
+                emit_found_file(self.out_dir, self.index_entries, "mp4", self.start_off, self.tmp_path, r)
+                self.count += 1
+                self.reset_stream()
+                self._update_tail(chunk, got)
+                return
+
+            self._update_tail(chunk, got)
+            return
+
+        try:
+            with self.tmp_path.open("ab") as f:
+                f.write(chunk[:got])
+        except Exception:
+            self.reset_stream()
+            self._update_tail(chunk, got)
+            return
+
+        self.written += got
+        if self.written > self.maxb:
+            self.reset_stream()
+            self._update_tail(chunk, got)
+            return
+
+        r = self._feed_parser(bytes(chunk[:got]))
+        if r == -1:
+            self.reset_stream()
+            self._update_tail(chunk, got)
+            return
+        if isinstance(r, int):
+            emit_found_file(self.out_dir, self.index_entries, "mp4", self.start_off, self.tmp_path, r)
+            self.count += 1
+            self.reset_stream()
+
+        self._update_tail(chunk, got)
 
 class TxtCarver:
     __slots__ = ("tail_max", "tail", "slb", "maxb", "maxn", "minb", "out_dir", "count", "checked", "index_entries")
@@ -1281,12 +1749,117 @@ class NesCarver(BaseCarver):
         def u16le(off: int) -> int:
             return b[off] | (b[off + 1] << 8)
 
-        nmi   = u16le(prg_end - 6)
         reset = u16le(prg_end - 4)
-        irq   = u16le(prg_end - 2)
-
         if not (0x8000 <= reset <= 0xFFFF):
             return -1
+
+        return total
+
+class NspCarver(BaseCarver):
+    def try_end(self) -> int:
+        if self.slb.n() > self.maxb:
+            return -1
+        if self.slb.n() < 0x10:
+            return 0
+
+        b, base, n = self.slb.buf, self.slb.start, self.slb.n()
+
+        if b[base:base + 4] != PFS0_SIG:
+            return -1
+
+        entry_count = U32(b, base + 4)[0]
+        str_sz      = U32(b, base + 8)[0]
+        reserved    = U32(b, base + 0xC)[0]
+
+        if reserved != 0:
+            return -1
+        if entry_count == 0 or entry_count > 0x2000:
+            return -1
+        if str_sz > 4 * 1024 * 1024:
+            return -1
+
+        ent_table = 0x10
+        ent_size  = 0x18
+        ent_bytes = entry_count * ent_size
+        hdr_bytes = ent_table + ent_bytes
+
+        if hdr_bytes > self.maxb:
+            return -1
+        if n < hdr_bytes:
+            return 0
+
+        str_base = base + hdr_bytes
+        if hdr_bytes + str_sz > self.maxb:
+            return -1
+        if n < hdr_bytes + str_sz:
+            return 0
+
+        data_off = hdr_bytes + str_sz
+
+        max_end = 0
+        p = base + ent_table
+        str_end = str_base + str_sz
+
+        for _ in range(entry_count):
+            off = U64(b, p + 0x00)[0]
+            sz  = U64(b, p + 0x08)[0]
+            no  = U32(b, p + 0x10)[0]
+            rsv = U32(b, p + 0x14)[0]
+            p += ent_size
+
+            if rsv != 0:
+                return -1
+            if no >= str_sz:
+                return -1
+
+            name_abs = str_base + no
+            nul = b.find(0, name_abs, str_end)
+            if nul < 0:
+                return -1
+
+            name = bytes(b[name_abs:nul])
+            if not name or any(c < 0x20 or c > 0x7E for c in name):
+                return -1
+
+            if off > self.maxb or sz > self.maxb:
+                return -1
+            end = off + sz
+            if end < off:
+                return -1
+            if end > max_end:
+                max_end = end
+
+        total = data_off + max_end
+        if not (self.minb <= total <= self.maxb):
+            return -1
+        return 0 if total > n else total
+
+class GifCarver(BaseCarver):
+    def try_end(self):
+        if self.slb.n() > self.maxb: return -1
+        r = gif_end(self.slb, self.maxb)
+        return 0 if r is None else r
+
+class WebpCarver(BaseCarver):
+    def try_end(self):
+        if self.slb.n() > self.maxb: return -1
+        if self.slb.n() < 12: return 0
+
+        b, base, n = self.slb.buf, self.slb.start, self.slb.n()
+        if b[base:base + 4] != WEBP_RIFF: return -1
+        if b[base + 8:base + 12] != WEBP_WEBP: return -1
+
+        total = U32(b, base + 4)[0] + 8
+        if total < 12 or total > self.maxb: return -1
+        if total > n: return 0
+
+        if total >= 20:
+            tag = bytes(b[base + 12:base + 16])
+            if tag not in (b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP", b"EXIF", b"XMP "):
+                return -1
+            csz = U32(b, base + 16)[0]
+            if 20 + csz > total + 1:
+                return -1
 
         return total
 
@@ -1298,6 +1871,9 @@ CARVERS = {
     "exe": ExeCarver,
     "pdf": PdfCarver,
     "nes": NesCarver,
+    "nsp": NspCarver,
+    "gif": GifCarver,
+    "webp": WebpCarver,
 }
 
 # ---- index writer ----
@@ -1312,7 +1888,8 @@ def rewrite_index(out_root: Path, entries: list[tuple[int, str, int]], scan_off:
 
 # ---- carve stream ----
 
-def stream_carve(dev: WinRawDevice, nt: NTFSInfo, bitmap: bytes, out_root: Path, types: set[str], read_block: int, max_scan_bytes: int, start_abs_off: int, existing_entries):
+def stream_carve(dev: WinRawDevice, fs, free_runs: Iterator[tuple[int, int]], out_root: Path, types: set[str],
+                 read_block: int, max_scan_bytes: int, start_abs_off: int, existing_entries):
     out_root.mkdir(parents=True, exist_ok=True)
     index_entries: list[tuple[int, str, int]] = list(existing_entries)
 
@@ -1323,6 +1900,8 @@ def stream_carve(dev: WinRawDevice, nt: NTFSInfo, bitmap: bytes, out_root: Path,
         L = LIMITS[t]
         if t == "mp3":
             carvers[t] = Mp3Carver(d, index_entries)
+        elif t == "mp4":
+            carvers[t] = Mp4Carver(d, index_entries)
         elif t == "txt":
             carvers[t] = TxtCarver(d, index_entries)
         else:
@@ -1341,12 +1920,12 @@ def stream_carve(dev: WinRawDevice, nt: NTFSInfo, bitmap: bytes, out_root: Path,
     rewrite_index(out_root, index_entries, scan_off)
     written_upto = len(index_entries)
 
-    for start_cl, run_len in iter_free_cluster_runs(bitmap):
+    for start_cl, run_len in free_runs:
         if scanned >= max_scan_bytes:
             break
 
-        run_off = start_cl * nt.bpc
-        run_bytes = run_len * nt.bpc
+        run_off = fs.cl_to_off(start_cl)
+        run_bytes = run_len * fs.bpc
         to_process = min(run_bytes, max_scan_bytes - scanned)
         if to_process <= 0:
             break
@@ -1413,7 +1992,7 @@ def stream_carve(dev: WinRawDevice, nt: NTFSInfo, bitmap: bytes, out_root: Path,
 
 # ---- wipe ----
 
-def wipe_unallocated(dev: WinRawDevice, nt: NTFSInfo, bitmap: bytes, write_block: int, max_scan_bytes: int) -> int:
+def wipe_unallocated(dev: WinRawDevice, fs, free_runs: Iterator[tuple[int, int]], write_block: int, max_scan_bytes: int) -> int:
     write_block -= (write_block % SECTOR_ALIGN)
     write_block = max(write_block, SECTOR_ALIGN)
     max_scan_bytes -= (max_scan_bytes % SECTOR_ALIGN)
@@ -1426,11 +2005,11 @@ def wipe_unallocated(dev: WinRawDevice, nt: NTFSInfo, bitmap: bytes, write_block
 
     dev.try_lock_dismount()
     try:
-        for start_cl, run_len in iter_free_cluster_runs(bitmap):
+        for start_cl, run_len in free_runs:
             if wiped >= max_scan_bytes:
                 break
-            run_off = start_cl * nt.bpc
-            run_bytes = run_len * nt.bpc
+            run_off = fs.cl_to_off(start_cl)
+            run_bytes = run_len * fs.bpc
             to_process = min(run_bytes, max_scan_bytes - wiped)
             to_process -= (to_process % SECTOR_ALIGN)
             if to_process <= 0:
@@ -1488,8 +2067,16 @@ def norm_vol(s: str) -> str:
         s = s[0].upper() + s[1:]
     return r"\\.\%s" % s
 
+def _pause_on_exit():
+    try:
+        input()
+    except Exception:
+        pass
+
+atexit.register(_pause_on_exit)
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="NTFS unallocated-space carver (or wipe unallocated space). Run as Administrator.")
+    ap = argparse.ArgumentParser(description="NTFS/FAT32 unallocated-space carver (or wipe unallocated space). Run as Administrator.")
     ap.add_argument("volume", nargs="?", default=None, help=r"e.g. \\.\F: (or just F)")
     ap.add_argument("--types", type=parse_types, default=None, help="png,jpg,zip,7z,exe,pdf,mp3,txt or all/* (default: prompt)")
     ap.add_argument("--chunk-limit", type=lambda x: int(x, 0), default=CHUNK_LIMIT_DEFAULT, help="kept for compatibility (unused)")
@@ -1519,7 +2106,7 @@ def main() -> int:
     if args.types is None:
         args.types = set()
 
-    serial = ntfs_serial(args.volume)
+    serial = volume_serial(args.volume)
     script_dir = Path(__file__).resolve().parent
     out_root = None
     resume_off = 0
@@ -1537,59 +2124,109 @@ def main() -> int:
                 existing_entries, resume_off = load_index(out_root)
                 print(f"Resuming from offset: 0x{resume_off:016X}")
 
-    try:
-        with open_device(args.volume, write=args.wipe) as dev:
-            boot = dev.read_exact(0, 512)
-            nt = parse_ntfs_boot(boot)
-            vol_bytes = nt.total_sectors * nt.bps
-            mft0_off = nt.mft_lcn * nt.bpc
+    for retry in range(2):
+        try:
+            with open_device(args.volume, write=args.wipe) as dev:
+                boot = dev.read_exact(0, 512)
 
-            print(f"NTFS: serial={serial} bps={nt.bps} bytes_per_cluster={nt.bpc} file_record_size={nt.frs} mft_lcn={nt.mft_lcn}")
-            print(f"Volume size: {fmt_bytes(vol_bytes)} ({vol_bytes} bytes)")
-            print(f"MFT[0] byte offset: {mft0_off}")
-            print(f"Carve types: {', '.join(sorted(args.types)) if args.types else '(none)'}")
+                fs_type = None
+                nt = None
+                fat = None
 
-            bitmap = load_bitmap(dev, nt)
-            print(f"Loaded $Bitmap: {len(bitmap)} bytes -> {len(bitmap) * 8} cluster bits")
+                if boot[3:11] == b"NTFS    ":
+                    fs_type = "ntfs"
+                    nt = parse_ntfs_boot(boot)
 
-            total_unalloc = unalloc_bytes(nt, bitmap, vol_bytes)
-            max_scan = total_unalloc - (total_unalloc % SECTOR_ALIGN)
-            print(f"Auto scan/wipe target (all unallocated clusters): {fmt_bytes(max_scan)} ({max_scan} bytes)")
+                    fix = win_bps_bpc(args.volume)
+                    if fix:
+                        bps_api, bpc_api = fix
+                        if (bps_api, bpc_api) != (nt.bps, nt.bpc):
+                            print(f"NOTE: overriding NTFS geometry from WinAPI: bps={bps_api} bpc={bpc_api} (boot said bps={nt.bps} bpc={nt.bpc})")
+                        nt = NTFSInfo(bps=bps_api, bpc=bpc_api, total_sectors=nt.total_sectors, mft_lcn=nt.mft_lcn, frs=nt.frs)
 
-            if args.wipe:
-                ans = input(
-                    f"\n*** WIPE MODE ENABLED ***\n"
-                    f"This will ZERO-FILL ALL UNALLOCATED SPACE on {args.volume} ({fmt_bytes(max_scan)}).\n"
-                    f"Type WIPE to proceed: "
-                ).strip()
-                if ans != "WIPE":
-                    print("Wipe cancelled.")
-                    return 1
-                wiped = wipe_unallocated(dev, nt, bitmap, write_block=READ_BLOCK_DEFAULT, max_scan_bytes=max_scan)
+                    fs = nt
+                    vol_bytes = nt.total_sectors * nt.bps
+                    mft0_off = nt.mft_lcn * nt.bpc
+
+                    print(f"NTFS: serial={serial} bps={nt.bps} bytes_per_cluster={nt.bpc} file_record_size={nt.frs} mft_lcn={nt.mft_lcn}")
+                    print(f"Volume size: {fmt_bytes(vol_bytes)} ({vol_bytes} bytes)")
+                    print(f"MFT[0] byte offset: {mft0_off}")
+                    print(f"Carve types: {', '.join(sorted(args.types)) if args.types else '(none)'}")
+
+                    bitmap = load_bitmap(dev, nt)
+                    print(f"Loaded $Bitmap: {len(bitmap)} bytes -> {len(bitmap) * 8} cluster bits")
+
+                    total_unalloc = unalloc_bytes_ntfs(nt, bitmap, vol_bytes)
+                    max_scan = total_unalloc - (total_unalloc % SECTOR_ALIGN)
+                    print(f"Auto scan/wipe target (all unallocated clusters): {fmt_bytes(max_scan)} ({max_scan} bytes)")
+
+                    free_runs = iter_free_cluster_runs_ntfs(bitmap)
+
+                else:
+                    if boot[0x52:0x5A].rstrip(b"\x00 ").startswith(b"FAT32"):
+                        fs_type = "fat32"
+                        fat = parse_fat32_boot(boot)
+                        fs = fat
+                        vol_bytes = fat.total_sectors * fat.bps
+
+                        print(f"FAT32: serial={serial} bps={fat.bps} spc={fat.spc} bytes_per_cluster={fat.bpc}")
+                        print(f"      reserved={fat.reserved} nfats={fat.nfats} fatsz(sectors)={fat.fatsz} root_cluster={fat.root_cluster}")
+                        print(f"      first_data_sector={fat.first_data_sector} total_clusters={fat.total_clusters}")
+                        print(f"Volume size: {fmt_bytes(vol_bytes)} ({vol_bytes} bytes)")
+                        print(f"Carve types: {', '.join(sorted(args.types)) if args.types else '(none)'}")
+
+                        free_clusters = fat32_count_free_clusters(dev, fat)
+                        total_unalloc = free_clusters * fat.bpc
+                        max_scan = total_unalloc - (total_unalloc % SECTOR_ALIGN)
+                        print(f"Auto scan/wipe target (all unallocated clusters): {fmt_bytes(max_scan)} ({max_scan} bytes)")
+                        print(f"Free clusters (counted from FAT): {free_clusters}")
+
+                        free_runs = iter_free_cluster_runs_fat32(dev, fat)
+                    else:
+                        raise ValueError("Unsupported filesystem (expected NTFS or FAT32).")
+
+                if args.wipe:
+                    ans = input(
+                        f"\n*** WIPE MODE ENABLED ***\n"
+                        f"This will ZERO-FILL ALL UNALLOCATED SPACE on {args.volume} ({fmt_bytes(max_scan)}).\n"
+                        f"Type WIPE to proceed: "
+                    ).strip()
+                    if ans != "WIPE":
+                        print("Wipe cancelled.")
+                        return 1
+                    wiped = wipe_unallocated(dev, fs, free_runs=free_runs, write_block=READ_BLOCK_DEFAULT, max_scan_bytes=max_scan)
+                    print("\nDone.")
+                    print(f"Unallocated bytes wiped (zero-filled): {wiped}")
+                    return 0
+
+                scanned, counts = stream_carve(
+                    dev=dev, fs=fs, free_runs=free_runs,
+                    out_root=out_root, types=args.types,
+                    read_block=READ_BLOCK_DEFAULT, max_scan_bytes=max_scan,
+                    start_abs_off=resume_off, existing_entries=existing_entries,
+                )
+
                 print("\nDone.")
-                print(f"Unallocated bytes wiped (zero-filled): {wiped}")
-                return 0
+                print(f"Unallocated bytes processed: {scanned}")
+                for t in sorted(args.types):
+                    print(f"Carved {t.upper()}: {counts.get(t, 0)} -> {out_root / t}")
 
-            scanned, counts = stream_carve(
-                dev=dev, nt=nt, bitmap=bitmap,
-                out_root=out_root, types=args.types,
-                read_block=READ_BLOCK_DEFAULT, max_scan_bytes=max_scan,
-                start_abs_off=resume_off, existing_entries=existing_entries,
-            )
+            return 0
 
-            print("\nDone.")
-            print(f"Unallocated bytes processed: {scanned}")
-            for t in sorted(args.types):
-                print(f"Carved {t.upper()}: {counts.get(t, 0)} -> {out_root / t}")
+        except PermissionError:
+            print("Permission denied. Run as Administrator.", file=sys.stderr)
+            return 2
 
-        return 0
+        except Exception as e:
+            if retry == 0 and "Bad MFT record" in str(e):
+                if input("Bad MFT record, run chkdsk then scrape? Leave blank for 'yes': ").strip().lower() not in ("n", "no"):
+                    os.system(f"chkdsk {args.volume[4]}: /f /r /x")
+                    continue
+                print("Aborting (chkdsk declined).", file=sys.stderr)
+                return 4
 
-    except PermissionError:
-        print("Permission denied. Run as Administrator.", file=sys.stderr)
-        return 2
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 4
+            print(f"Error: {e}", file=sys.stderr)
+            return 4
 
 if __name__ == "__main__":
     raise SystemExit(main())
