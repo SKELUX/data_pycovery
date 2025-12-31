@@ -17,4 +17,4 @@ If you prefer to skip the prompts (Where X is the drive letter): python data_pyc
 If you are not trying to recover files, but instead trying to prevent data recovery by formatting unallocated clusters, run as admin and use --wipe.
 
 Formats currently recovered during scan:
-7z, exe, jpg, mp3, pdf, png, txt, zip, nes
+7z, exe, gif, jpg, mp3, mp4, nes, nsp, pdf, png, txt, webp, zip
