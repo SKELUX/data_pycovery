@@ -1,7 +1,5 @@
 # data_pycovery
-A crappy but opensource data recovery option, just bulk dumps every recognized file format it can find.
-
-Also able to format unallocated clusters, while leaving existing files alone.
+Bulk dumps every recognized file format it can find, doubles as a data privacy tool to format unallocated clusters.
 
 Currently only supports NTFS, on Windows. FAT support is incomplete, use with caution.
 
